@@ -288,15 +288,21 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
         val epBase = base ?: slug
 
         // 3) The page of a season's first episode lists that season's real titles and links
+        val seasonNotes = mutableMapOf<Int, String>()
         seasonStarts
             .filterKeys { s -> episodes.values.none { it.season == s && it.title != null } }
             .forEach { (s, from) ->
-                runCatching {
-                    val seasonPage = client.newCall(GET("$baseUrl/episode/$epBase-${s}x$from/", headers))
-                        .execute()
-                        .use { if (it.isSuccessful) it.asJsoup() else null }
-                    seasonPage?.collectEpisodes(episodes)
-                }
+                seasonNotes[s] = runCatching {
+                    client.newCall(GET("$baseUrl/episode/$epBase-${s}x$from/", headers)).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val page = resp.asJsoup()
+                            page.collectEpisodes(episodes)
+                            "no titles on site (${page.select("li a[href*=/episode/]").size} items)"
+                        } else {
+                            "season page HTTP ${resp.code}"
+                        }
+                    }
+                }.getOrElse { "season page failed: ${it.javaClass.simpleName}" }
             }
 
         val multiSeason = episodes.keys.map { it.first }.distinct().size > 1
@@ -309,7 +315,11 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
                     val prefix = if (multiSeason) "S${ep.season} E${ep.number}" else "Episode ${ep.number}"
                     name = if (ep.title.isNullOrBlank()) prefix else "$prefix - ${ep.title}"
                     episode_number = ep.number.toFloat()
-                    scanlator = if (ep.sub) "Sub" else null
+                    scanlator = when {
+                        ep.sub -> "Sub"
+                        ep.title.isNullOrBlank() -> seasonNotes[ep.season]
+                        else -> null
+                    }
                 }
             }
     }
@@ -317,12 +327,15 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
     private fun Element.episodeTitle(): String? {
         var node: Element? = this
         while (node != null && node.tagName() != "li") node = node.parent()
-        val heading = node?.selectFirst("h2") ?: return null
-        return heading.ownText().ifBlank { heading.text() }
-            .trim()
-            .removeSuffix("View")
-            .trim()
-            .takeUnless { it.isEmpty() || PLACEHOLDER_TITLE_REGEX.matches(it) }
+        val item = node ?: return null
+
+        return sequenceOf(
+            item.selectFirst("h2, h3")?.let { it.ownText().ifBlank { it.text() } },
+            item.selectFirst("a[title]")?.attr("title"),
+            item.selectFirst("img[alt]")?.attr("alt")?.removePrefix("Image"),
+        )
+            .mapNotNull { it?.trim()?.removeSuffix("View")?.trim() }
+            .firstOrNull { it.isNotEmpty() && !PLACEHOLDER_TITLE_REGEX.matches(it) }
     }
 
     // ============================== Videos ================================
@@ -531,22 +544,46 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             )
         }
 
-        return master.substringAfter("#EXT-X-STREAM-INF:").split("#EXT-X-STREAM-INF:").mapNotNull { chunk ->
+        // Several separate audio files: one entry per language, so the language can be picked
+        // (or downloaded) from the video list.
+        val perLanguage = audioTracks.size >= 2
+        val mixedAudio = media
+            .filter { it["TYPE"] == "AUDIO" && it["URI"] == null }
+            .mapNotNull { it["NAME"] ?: it["LANGUAGE"] }
+
+        return master.substringAfter("#EXT-X-STREAM-INF:").split("#EXT-X-STREAM-INF:").flatMap { chunk ->
             val info = chunk.substringBefore("\n")
             val quality = RESOLUTION_REGEX.find(info)?.groupValues?.get(1)?.let { "${it}p" } ?: "Video"
             val streamUrl = chunk.substringAfter("\n").lineSequence()
                 .map(String::trim)
                 .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
                 ?.let(::absolute)
-                ?: return@mapNotNull null
-            Video(
-                streamUrl,
-                "$label - $quality",
-                streamUrl,
-                headers = videoHeaders,
-                subtitleTracks = subtitleTracks,
-                audioTracks = audioTracks,
-            )
+                ?: return@flatMap emptyList<Video>()
+
+            if (perLanguage) {
+                audioTracks.map { track ->
+                    Video(
+                        streamUrl,
+                        "$label - $quality [${track.lang}]",
+                        streamUrl,
+                        headers = videoHeaders,
+                        subtitleTracks = subtitleTracks,
+                        audioTracks = listOf(track),
+                    )
+                }
+            } else {
+                val note = if (mixedAudio.size >= 2) " [audio inside stream: ${mixedAudio.joinToString()}]" else ""
+                listOf(
+                    Video(
+                        streamUrl,
+                        "$label - $quality$note",
+                        streamUrl,
+                        headers = videoHeaders,
+                        subtitleTracks = subtitleTracks,
+                        audioTracks = audioTracks,
+                    ),
+                )
+            }
         }
     }
 
@@ -615,8 +652,12 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private fun List<Video>.sortedByPreference(): List<Video> {
         val preferred = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
+        val audioPref = preferences.getString(PREF_AUDIO_KEY, PREF_ANY)!!
         return sortedWith(
-            compareByDescending<Video> { it.quality.contains(preferred) }
+            compareByDescending<Video> {
+                audioPref != PREF_ANY && it.quality.substringAfter('[', "").matchesLanguage(audioPref)
+            }
+                .thenByDescending { it.quality.contains(preferred) }
                 .thenByDescending { QUALITY_REGEX.find(it.quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0 },
         )
     }
