@@ -25,4 +25,3 @@ jobs:
         with:
           name: animesalt-apk
           path: src/all/animesalt/build/outputs/apk/debug/*.apk
-          
