@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.lib.playlistutils.PlaylistUtils
@@ -288,7 +289,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
         // 3) The page of a season's first episode lists that season's real titles and links
         seasonStarts
-            .filterKeys { s -> episodes.values.none { it.season == s && it.path != null } }
+            .filterKeys { s -> episodes.values.none { it.season == s && it.title != null } }
             .forEach { (s, from) ->
                 runCatching {
                     val seasonPage = client.newCall(GET("$baseUrl/episode/$epBase-${s}x$from/", headers))
@@ -321,7 +322,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             .trim()
             .removeSuffix("View")
             .trim()
-            .ifEmpty { null }
+            .takeUnless { it.isEmpty() || PLACEHOLDER_TITLE_REGEX.matches(it) }
     }
 
     // ============================== Videos ================================
@@ -398,7 +399,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
         // FirePlayer-style hosts: https://host/video/<hash>
         FIREPLAYER_PATH_REGEX.find(path)?.let { m ->
-            val videos = runCatching { fireplayerVideos(httpUrl, m.groupValues[1], label) }
+            val videos = runCatching { fireplayerVideos(httpUrl, m.groupValues[1], label, referer) }
                 .getOrDefault(emptyList())
             if (videos.isNotEmpty()) return videos
         }
@@ -417,7 +418,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             }
         }
         if (streams.isNotEmpty()) {
-            val found = videosFromStreams(streams, embedUrl, label, pageHeaders)
+            val found = videosFromStreams(streams, embedUrl, label, pageHeaders, findSubtitles(script))
             if (found.isNotEmpty()) return found
         }
 
@@ -441,27 +442,27 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             .flatMap { runCatching { videosFromEmbed(it, embedUrl, depth + 1) }.getOrDefault(emptyList()) }
     }
 
-    private fun videosFromStreams(streams: Collection<String>, embedUrl: String, label: String, base: Headers): List<Video> {
+    private fun videosFromStreams(
+        streams: Collection<String>,
+        embedUrl: String,
+        label: String,
+        base: Headers,
+        subs: List<Track> = emptyList(),
+    ): List<Video> {
         val videos = mutableListOf<Video>()
         streams.forEach { stream ->
             if (stream.substringBefore('?').endsWith(".mp4")) {
                 val mp4Headers = base.newBuilder().set("Referer", embedUrl).build()
-                videos += Video(stream, "$label - MP4", stream, mp4Headers)
+                videos += Video(stream, "$label - MP4", stream, mp4Headers, subtitleTracks = orderedSubtitles(subs))
             } else {
-                videos += runCatching {
-                    playlistUtils.extractFromHls(
-                        stream,
-                        embedUrl,
-                        videoNameGen = { quality -> "$label - $quality" },
-                    )
-                }.getOrDefault(emptyList())
+                videos += runCatching { hlsVideos(stream, embedUrl, label, subs) }.getOrDefault(emptyList())
             }
         }
         return videos
     }
 
     /** FirePlayer: POST /player/index.php?data=<hash>&do=getVideo returns the HLS master playlist. */
-    private fun fireplayerVideos(url: HttpUrl, hash: String, label: String): List<Video> {
+    private fun fireplayerVideos(url: HttpUrl, hash: String, label: String, referer: String): List<Video> {
         val host = "${url.scheme}://${url.host}"
         val apiHeaders = headers.newBuilder()
             .set("X-Requested-With", "XMLHttpRequest")
@@ -482,11 +483,119 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             ?: VIDEO_SOURCE_REGEX.find(text)?.groupValues?.get(1)
             ?: return emptyList()
 
-        return playlistUtils.extractFromHls(
-            master,
-            url.toString(),
-            videoNameGen = { quality -> "$label - $quality" },
-        )
+        // The player page / API reply can also list external subtitle files
+        val pageText = runCatching {
+            val pageHeaders = headers.newBuilder().set("Referer", referer).build()
+            client.newCall(GET(url.toString(), pageHeaders)).execute()
+                .use { if (it.isSuccessful) it.body.string() else "" }
+        }.getOrDefault("")
+
+        return hlsVideos(master, url.toString(), label, findSubtitles(pageText + "\n" + text))
+    }
+
+    // ============================ HLS / tracks ============================
+
+    private fun hlsVideos(playlistUrl: String, referer: String, label: String, externalSubs: List<Track>): List<Video> {
+        val videoHeaders = playlistUtils.generateMasterHeaders(headers, referer)
+        val master = client.newCall(GET(playlistUrl, videoHeaders)).execute().use { it.body.string() }
+        val base = playlistUrl.toHttpUrl()
+        fun absolute(raw: String): String? = base.resolve(raw.trim())?.toString()
+
+        val media = MEDIA_TAG_REGEX.findAll(master).map { parseHlsAttributes(it.groupValues[1]) }.toList()
+        val audio = media
+            .filter { it["TYPE"] == "AUDIO" }
+            .mapNotNull { m ->
+                val uri = m["URI"]?.let(::absolute) ?: return@mapNotNull null
+                Track(uri, m["NAME"] ?: m["LANGUAGE"] ?: "Audio")
+            }
+        val embeddedSubs = media
+            .filter { it["TYPE"] == "SUBTITLES" }
+            .mapNotNull { m ->
+                val uri = m["URI"]?.let(::absolute) ?: return@mapNotNull null
+                Track(uri, m["NAME"] ?: m["LANGUAGE"] ?: "Subtitle")
+            }
+
+        val audioTracks = orderedAudio(audio)
+        val subtitleTracks = orderedSubtitles(externalSubs + embeddedSubs)
+
+        if (!master.contains("#EXT-X-STREAM-INF")) {
+            return listOf(
+                Video(
+                    playlistUrl,
+                    "$label - Video",
+                    playlistUrl,
+                    headers = videoHeaders,
+                    subtitleTracks = subtitleTracks,
+                    audioTracks = audioTracks,
+                ),
+            )
+        }
+
+        return master.substringAfter("#EXT-X-STREAM-INF:").split("#EXT-X-STREAM-INF:").mapNotNull { chunk ->
+            val info = chunk.substringBefore("\n")
+            val quality = RESOLUTION_REGEX.find(info)?.groupValues?.get(1)?.let { "${it}p" } ?: "Video"
+            val streamUrl = chunk.substringAfter("\n").lineSequence()
+                .map(String::trim)
+                .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                ?.let(::absolute)
+                ?: return@mapNotNull null
+            Video(
+                streamUrl,
+                "$label - $quality",
+                streamUrl,
+                headers = videoHeaders,
+                subtitleTracks = subtitleTracks,
+                audioTracks = audioTracks,
+            )
+        }
+    }
+
+    private fun parseHlsAttributes(line: String): Map<String, String> =
+        HLS_ATTR_REGEX.findAll(line).associate { it.groupValues[1] to it.groupValues[2].trim('"') }
+
+    private fun findSubtitles(text: String): List<Track> {
+        val clean = text.replace("\\/", "/")
+        val found = linkedMapOf<String, String>() // url -> label
+
+        fun isSubtitle(url: String) = SUBTITLE_SKIP_PARTS.none { url.contains(it, ignoreCase = true) }
+
+        JSON_OBJECT_REGEX.findAll(clean).forEach { m ->
+            val obj = m.value
+            if (obj.contains("thumbnails", ignoreCase = true)) return@forEach
+            val url = SUBTITLE_URL_REGEX.find(obj)?.value ?: return@forEach
+            if (url !in found && isSubtitle(url)) {
+                found[url] = SUBTITLE_LABEL_REGEX.find(obj)?.groupValues?.get(1) ?: labelFromUrl(url)
+            }
+        }
+        BRACKET_SUBTITLE_REGEX.findAll(clean).forEach { m ->
+            val url = m.groupValues[2]
+            if (url !in found && isSubtitle(url)) found[url] = m.groupValues[1]
+        }
+        SUBTITLE_URL_REGEX.findAll(clean).forEach { m ->
+            if (m.value !in found && isSubtitle(m.value)) found[m.value] = labelFromUrl(m.value)
+        }
+
+        return found.map { (url, label) -> Track(url, label.trim().ifEmpty { "Subtitle" }) }
+    }
+
+    private fun labelFromUrl(url: String): String =
+        url.substringBefore('?').substringAfterLast('/').substringBeforeLast('.')
+
+    private fun orderedAudio(tracks: List<Track>): List<Track> =
+        tracks.orderedBy(preferences.getString(PREF_AUDIO_KEY, PREF_ANY)!!)
+
+    private fun orderedSubtitles(tracks: List<Track>): List<Track> {
+        val pref = preferences.getString(PREF_SUB_KEY, PREF_ANY)!!
+        return if (pref == PREF_OFF) emptyList() else tracks.orderedBy(pref)
+    }
+
+    /** Puts tracks of the preferred language first (the sort is stable). */
+    private fun List<Track>.orderedBy(pref: String): List<Track> =
+        if (pref == PREF_ANY) this else sortedByDescending { it.lang.matchesLanguage(pref) }
+
+    private fun String.matchesLanguage(code: String): Boolean {
+        val aliases = LANGUAGE_ALIASES[code] ?: return contains(code, ignoreCase = true)
+        return lowercase().split(NON_LETTER_REGEX).any { it in aliases }
     }
 
     /** Returns the page source with every `eval(function(p,a,c,k,e,d)...)` block appended in unpacked form. */
@@ -524,6 +633,32 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             setOnPreferenceChangeListener { _, _ -> true }
         }.also(screen::addPreference)
 
+        val languageChoices = LANGUAGES.drop(1)
+
+        ListPreference(screen.context).apply {
+            key = PREF_AUDIO_KEY
+            title = "Default audio language"
+            entries = (listOf("Default (let the player decide)") + languageChoices.map { it.first })
+                .toTypedArray<CharSequence>()
+            entryValues = (listOf(PREF_ANY) + languageChoices.map { it.second })
+                .toTypedArray<CharSequence>()
+            setDefaultValue(PREF_ANY)
+            summary = "%s"
+            setOnPreferenceChangeListener { _, _ -> true }
+        }.also(screen::addPreference)
+
+        ListPreference(screen.context).apply {
+            key = PREF_SUB_KEY
+            title = "Default subtitles"
+            entries = (listOf("Default (all, site order)", "Off (hide subtitles)") + languageChoices.map { it.first })
+                .toTypedArray<CharSequence>()
+            entryValues = (listOf(PREF_ANY, PREF_OFF) + languageChoices.map { it.second })
+                .toTypedArray<CharSequence>()
+            setDefaultValue(PREF_ANY)
+            summary = "%s"
+            setOnPreferenceChangeListener { _, _ -> true }
+        }.also(screen::addPreference)
+
         ListPreference(screen.context).apply {
             key = PREF_QUALITY_KEY
             title = "Preferred quality"
@@ -543,6 +678,36 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
         private const val MAX_SEASON_SPAN = 5000
         private const val MAX_EMBED_DEPTH = 3
+
+        private const val PREF_AUDIO_KEY = "preferred_audio"
+        private const val PREF_SUB_KEY = "preferred_subtitles"
+        private const val PREF_ANY = "any"
+        private const val PREF_OFF = "off"
+
+        private val PLACEHOLDER_TITLE_REGEX = Regex("""(?i)^(?:episode\s*\d+|.*\b\d+x\d+)$""")
+
+        private val MEDIA_TAG_REGEX = Regex("""#EXT-X-MEDIA:([^\r\n]*)""")
+        private val HLS_ATTR_REGEX = Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
+        private val RESOLUTION_REGEX = Regex("""RESOLUTION=\d+x(\d+)""")
+
+        private val JSON_OBJECT_REGEX = Regex("""\{[^{}]*\}""")
+        private val SUBTITLE_URL_REGEX = Regex("""https?://[^\s"',\]\\]+?\.(?:vtt|srt|ass)(?:\?[^\s"',\]\\]*)?""", RegexOption.IGNORE_CASE)
+        private val BRACKET_SUBTITLE_REGEX = Regex("""\[([^\]\[]{1,40})\](https?://[^\s"',\\]+?\.(?:vtt|srt|ass)[^\s"',\\]*)""", RegexOption.IGNORE_CASE)
+        private val SUBTITLE_LABEL_REGEX = Regex(""""(?:label|lang|language|name|title)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+        private val SUBTITLE_SKIP_PARTS = listOf("thumb", "sprite", "storyboard", "preview")
+
+        private val NON_LETTER_REGEX = Regex("[^a-z]+")
+        private val LANGUAGE_ALIASES = mapOf(
+            "hindi" to setOf("hindi", "hin", "hi"),
+            "tamil" to setOf("tamil", "tam", "ta"),
+            "telugu" to setOf("telugu", "tel", "te"),
+            "english" to setOf("english", "eng", "en"),
+            "japanese" to setOf("japanese", "jpn", "jap", "ja"),
+            "bengali" to setOf("bengali", "bangla", "ben", "bn"),
+            "malayalam" to setOf("malayalam", "mal", "ml"),
+            "kannada" to setOf("kannada", "kan", "kn"),
+            "korean" to setOf("korean", "kor", "ko"),
+        )
 
         private val TRID_REGEX = Regex("""trid=(\d+)""")
         private val FIREPLAYER_PATH_REGEX = Regex("""/video/([A-Za-z0-9_-]{16,})/?$""")
