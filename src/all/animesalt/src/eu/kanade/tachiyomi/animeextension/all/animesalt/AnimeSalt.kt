@@ -222,7 +222,26 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
     // ============================== Episodes ==============================
 
-    private class Ep(val season: Int, val number: Int, var title: String?, var sub: Boolean)
+    private class Ep(val season: Int, val number: Int, var title: String?, var sub: Boolean) {
+        var path: String? = null
+    }
+
+    /** Registers every episode link on the page; returns the series part of the episode slug. */
+    private fun Document.collectEpisodes(episodes: MutableMap<Pair<Int, Int>, Ep>): String? {
+        var base: String? = null
+        select("a[href*=/episode/]").forEach { a ->
+            val epPath = a.absUrl("href").toHttpUrlOrNull()?.encodedPath ?: return@forEach
+            val match = EPISODE_PATH_REGEX.find(epPath) ?: return@forEach
+            if (base == null) base = match.groupValues[1]
+            val season = match.groupValues[2].toInt()
+            val number = match.groupValues[3].toInt()
+            val title = a.episodeTitle()
+            val ep = episodes.getOrPut(season to number) { Ep(season, number, title, false) }
+            if (ep.title == null) ep.title = title
+            if (ep.path == null) ep.path = epPath
+        }
+        return base
+    }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val doc = response.asJsoup()
@@ -240,23 +259,10 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
         val slug = path.trim('/').substringAfterLast('/')
         val episodes = linkedMapOf<Pair<Int, Int>, Ep>()
-        var base: String? = null
+        val seasonStarts = linkedMapOf<Int, Int>()
 
         // 1) Episodes present in the HTML (normally only the first season)
-        doc.select("a[href*=/episode/]").forEach { a ->
-            val epPath = a.absUrl("href").toHttpUrlOrNull()?.encodedPath ?: return@forEach
-            val match = EPISODE_PATH_REGEX.find(epPath) ?: return@forEach
-            if (base == null) base = match.groupValues[1]
-            val season = match.groupValues[2].toInt()
-            val number = match.groupValues[3].toInt()
-            val title = a.episodeTitle()
-            val existing = episodes[season to number]
-            if (existing == null) {
-                episodes[season to number] = Ep(season, number, title, false)
-            } else if (existing.title == null) {
-                existing.title = title
-            }
-        }
+        val base = doc.collectEpisodes(episodes)
 
         // 2) Remaining seasons come from the season tabs: "Season 2 • 33-53 (21) [Sub]"
         doc.body().text().let { text ->
@@ -266,6 +272,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
                 val to = m.groupValues[3].ifEmpty { m.groupValues[2] }.toInt()
                 val sub = m.groupValues[4].contains("sub", ignoreCase = true)
                 if (to < from || to - from > MAX_SEASON_SPAN) return@forEach
+                seasonStarts[season] = from
                 for (number in from..to) {
                     val ep = episodes.getOrPut(season to number) { Ep(season, number, null, sub) }
                     if (sub) ep.sub = true
@@ -274,13 +281,26 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
         }
 
         val epBase = base ?: slug
+
+        // 3) The page of a season's first episode lists that season's real titles and links
+        seasonStarts
+            .filterKeys { s -> episodes.values.none { it.season == s && it.path != null } }
+            .forEach { (s, from) ->
+                runCatching {
+                    val seasonPage = client.newCall(GET("$baseUrl/episode/$epBase-${s}x$from/", headers))
+                        .execute()
+                        .use { if (it.isSuccessful) it.asJsoup() else null }
+                    seasonPage?.collectEpisodes(episodes)
+                }
+            }
+
         val multiSeason = episodes.keys.map { it.first }.distinct().size > 1
 
         return episodes.values
             .sortedWith(compareByDescending<Ep> { it.season }.thenByDescending { it.number })
             .map { ep ->
                 SEpisode.create().apply {
-                    url = "/episode/$epBase-${ep.season}x${ep.number}/"
+                    url = ep.path ?: "/episode/$epBase-${ep.season}x${ep.number}/"
                     val prefix = if (multiSeason) "S${ep.season} E${ep.number}" else "Episode ${ep.number}"
                     name = if (ep.title.isNullOrBlank()) prefix else "$prefix - ${ep.title}"
                     episode_number = ep.number.toFloat()
@@ -306,9 +326,26 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
         val doc = response.asJsoup()
         val embeds = collectEmbeds(doc)
 
-        return embeds
-            .flatMap { embed -> runCatching { videosFromEmbed(embed) }.getOrDefault(emptyList()) }
+        val errors = mutableListOf<String>()
+        val videos = embeds
+            .flatMap { embed ->
+                runCatching { videosFromEmbed(embed) }
+                    .onFailure { errors += "${embed.take(70)} -> ${it.message?.take(60)}" }
+                    .getOrDefault(emptyList())
+            }
             .sortedByPreference()
+
+        if (videos.isEmpty()) {
+            throw Exception(
+                buildString {
+                    append("No playable video found on ").append(response.request.url.encodedPath)
+                    append(". Embeds seen: ").append(embeds.size)
+                    embeds.take(4).forEach { append("\n• ").append(it.take(80)) }
+                    errors.take(3).forEach { append("\n! ").append(it) }
+                },
+            )
+        }
+        return videos
     }
 
     private fun collectEmbeds(doc: Document): List<String> {
@@ -382,6 +419,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     private fun serverLabel(host: String): String {
+        if (host.startsWith("as-cdn")) return "AnimeSalt"
         val name = host.removePrefix("www.").substringBeforeLast('.')
         return name.substringAfterLast('.').replaceFirstChar { it.uppercase() }
     }
@@ -435,7 +473,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
         private val EMBED_ATTRS = listOf("data-src", "data-url", "data-link", "data-embed", "data-video", "data-source", "data-iframe")
         private val EMBED_ATTR_SELECTOR = EMBED_ATTRS.joinToString(", ") { "[$it]" }
-        private val PLAYER_LINK_REGEX = Regex("""https?://as-cdn\d*\.top/video/[A-Za-z0-9_-]+""")
+        private val PLAYER_LINK_REGEX = Regex("""https?://[^\s"'<>\\]+/video/[A-Za-z0-9_-]{16,}""")
 
         private val BLOCKED_PARTS = listOf(
             "youtube.com", "youtu.be", "disqus", "google", "facebook", "twitter", "histats",
