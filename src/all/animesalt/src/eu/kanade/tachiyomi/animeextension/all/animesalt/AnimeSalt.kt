@@ -16,7 +16,11 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.lib.unpacker.Unpacker
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
+import okhttp3.FormBody
+import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
@@ -324,12 +328,13 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
 
     override fun videoListParse(response: Response): List<Video> {
         val doc = response.asJsoup()
-        val embeds = collectEmbeds(doc)
+        val pageUrl = response.request.url.toString()
+        val embeds = collectEmbeds(doc, response.request.url.encodedPath)
 
         val errors = mutableListOf<String>()
         val videos = embeds
             .flatMap { embed ->
-                runCatching { videosFromEmbed(embed) }
+                runCatching { videosFromEmbed(embed, pageUrl) }
                     .onFailure { errors += "${embed.take(70)} -> ${it.message?.take(60)}" }
                     .getOrDefault(emptyList())
             }
@@ -348,7 +353,7 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
         return videos
     }
 
-    private fun collectEmbeds(doc: Document): List<String> {
+    private fun collectEmbeds(doc: Document, pagePath: String): List<String> {
         val urls = linkedSetOf<String>()
 
         doc.select("iframe").forEach {
@@ -361,7 +366,16 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
         }
 
         // Player links that only appear as plain text / inside scripts
-        PLAYER_LINK_REGEX.findAll(doc.html().replace("\\/", "/")).forEach { urls += it.value }
+        val html = doc.html().replace("\\/", "/")
+        PLAYER_LINK_REGEX.findAll(html).forEach { urls += it.value }
+
+        // Toroplay theme: servers are the site's own "?trembed=N&trid=ID&trtype=T" player pages
+        if (urls.none { it.contains("trembed") }) {
+            TRID_REGEX.find(html)?.groupValues?.get(1)?.let { trid ->
+                val type = if (pagePath.startsWith("/movies/")) 1 else 2
+                for (i in 0..3) urls += "$baseUrl/?trembed=$i&trid=$trid&trtype=$type"
+            }
+        }
 
         return urls
             .filter { it.startsWith("http") }
@@ -370,31 +384,68 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             .distinct()
     }
 
-    private fun videosFromEmbed(embedUrl: String): List<Video> {
+    private fun videosFromEmbed(embedUrl: String, referer: String, depth: Int = 0): List<Video> {
+        if (depth > MAX_EMBED_DEPTH) return emptyList()
         val httpUrl = embedUrl.toHttpUrlOrNull() ?: return emptyList()
         val label = serverLabel(httpUrl.host)
-        val embedHeaders = headers.newBuilder().set("Referer", "$baseUrl/").build()
+        val pageHeaders = headers.newBuilder().set("Referer", referer).build()
+        val path = httpUrl.encodedPath
 
-        val streamUrls = linkedSetOf<String>()
-        if (httpUrl.encodedPath.endsWith(".m3u8") || httpUrl.encodedPath.endsWith(".mp4")) {
-            streamUrls += embedUrl
-        } else {
-            val body = client.newCall(GET(embedUrl, embedHeaders)).execute().use { it.body.string() }
-            val script = unpackScripts(body).replace("\\/", "/")
+        // A direct stream file
+        if (path.endsWith(".m3u8") || path.endsWith(".mp4")) {
+            return videosFromStreams(listOf(embedUrl), embedUrl, label, pageHeaders)
+        }
 
-            STREAM_REGEXES.forEach { regex ->
-                regex.findAll(script).forEach { m ->
-                    val raw = m.groupValues[1]
-                    val resolved = if (raw.startsWith("http")) raw else httpUrl.resolve(raw)?.toString()
-                    if (resolved != null) streamUrls += resolved
-                }
+        // FirePlayer-style hosts: https://host/video/<hash>
+        FIREPLAYER_PATH_REGEX.find(path)?.let { m ->
+            val videos = runCatching { fireplayerVideos(httpUrl, m.groupValues[1], label) }
+                .getOrDefault(emptyList())
+            if (videos.isNotEmpty()) return videos
+        }
+
+        val body = client.newCall(GET(embedUrl, pageHeaders)).execute()
+            .use { if (it.isSuccessful) it.body.string() else "" }
+        if (body.isBlank()) return emptyList()
+
+        val script = unpackScripts(body).replace("\\/", "/")
+        val streams = linkedSetOf<String>()
+        STREAM_REGEXES.forEach { regex ->
+            regex.findAll(script).forEach { m ->
+                val raw = m.groupValues[1]
+                val resolved = if (raw.startsWith("http")) raw else httpUrl.resolve(raw)?.toString()
+                if (resolved != null) streams += resolved
+            }
+        }
+        if (streams.isNotEmpty()) {
+            val found = videosFromStreams(streams, embedUrl, label, pageHeaders)
+            if (found.isNotEmpty()) return found
+        }
+
+        // Nested embeds: the site's own "?trembed=" pages only contain an iframe to the real host
+        val nested = linkedSetOf<String>()
+        Jsoup.parse(body, embedUrl).select("iframe").forEach {
+            nested += it.absUrl("src")
+            nested += it.absUrl("data-src")
+        }
+        PLAYER_LINK_REGEX.findAll(script).forEach { nested += it.value }
+        listOf(META_REFRESH_REGEX, JS_REDIRECT_REGEX).forEach { regex ->
+            regex.find(body)?.groupValues?.get(1)?.let { raw ->
+                httpUrl.resolve(raw)?.toString()?.let { nested += it }
             }
         }
 
+        return nested
+            .filter { it.startsWith("http") && it != embedUrl }
+            .filterNot { url -> BLOCKED_PARTS.any { url.contains(it, ignoreCase = true) } }
+            .filterNot { url -> NOT_A_PLAYER_EXT.any { url.substringBefore('?').endsWith(it, ignoreCase = true) } }
+            .flatMap { runCatching { videosFromEmbed(it, embedUrl, depth + 1) }.getOrDefault(emptyList()) }
+    }
+
+    private fun videosFromStreams(streams: Collection<String>, embedUrl: String, label: String, base: Headers): List<Video> {
         val videos = mutableListOf<Video>()
-        streamUrls.forEach { stream ->
+        streams.forEach { stream ->
             if (stream.substringBefore('?').endsWith(".mp4")) {
-                val mp4Headers = embedHeaders.newBuilder().set("Referer", embedUrl).build()
+                val mp4Headers = base.newBuilder().set("Referer", embedUrl).build()
                 videos += Video(stream, "$label - MP4", stream, mp4Headers)
             } else {
                 videos += runCatching {
@@ -407,6 +458,35 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
             }
         }
         return videos
+    }
+
+    /** FirePlayer: POST /player/index.php?data=<hash>&do=getVideo returns the HLS master playlist. */
+    private fun fireplayerVideos(url: HttpUrl, hash: String, label: String): List<Video> {
+        val host = "${url.scheme}://${url.host}"
+        val apiHeaders = headers.newBuilder()
+            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Referer", url.toString())
+            .set("Origin", host)
+            .build()
+        val form = FormBody.Builder()
+            .add("hash", hash)
+            .add("r", "")
+            .build()
+
+        val text = client.newCall(POST("$host/player/index.php?data=$hash&do=getVideo", apiHeaders, body = form))
+            .execute()
+            .use { it.body.string() }
+            .replace("\\/", "/")
+
+        val master = SECURED_LINK_REGEX.find(text)?.groupValues?.get(1)
+            ?: VIDEO_SOURCE_REGEX.find(text)?.groupValues?.get(1)
+            ?: return emptyList()
+
+        return playlistUtils.extractFromHls(
+            master,
+            url.toString(),
+            videoNameGen = { quality -> "$label - $quality" },
+        )
     }
 
     /** Returns the page source with every `eval(function(p,a,c,k,e,d)...)` block appended in unpacked form. */
@@ -462,6 +542,14 @@ class AnimeSalt : ConfigurableAnimeSource, AnimeHttpSource() {
         private const val PREF_QUALITY_DEFAULT = "1080"
 
         private const val MAX_SEASON_SPAN = 5000
+        private const val MAX_EMBED_DEPTH = 3
+
+        private val TRID_REGEX = Regex("""trid=(\d+)""")
+        private val FIREPLAYER_PATH_REGEX = Regex("""/video/([A-Za-z0-9_-]{16,})/?$""")
+        private val SECURED_LINK_REGEX = Regex(""""securedLink"\s*:\s*"([^"]+)"""")
+        private val VIDEO_SOURCE_REGEX = Regex(""""videoSource"\s*:\s*"([^"]+)"""")
+        private val META_REFRESH_REGEX = Regex("""http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"']+)["']""", RegexOption.IGNORE_CASE)
+        private val JS_REDIRECT_REGEX = Regex("""(?:location(?:\.href)?\s*=|location\.replace\()\s*["']([^"']+)["']""")
 
         private val IMAGE_ATTRS = listOf("data-src", "data-lazy-src", "data-original", "src")
 
